@@ -26,6 +26,7 @@ class CleanupTests(unittest.TestCase):
                 raise RuntimeError("Test cleanup escaped its workspace")
             shutil.rmtree(folder)
 
+    # Confirms cleanup removes only the exact duplicate sample and preserves a restorable archive.
     def test_exact_match_only_and_restorable_archive(self):
         with self.workspace() as folder:
             path = Path(folder) / "workspace.sqlite3"
@@ -51,6 +52,7 @@ class CleanupTests(unittest.TestCase):
             engine.close()
             self.assertEqual(clean(path)["removed"],0)
 
+    # Verifies orphaned sample-related state is stripped from a cleaned workspace.
     def test_orphan_sample_settings_are_removed(self):
         with self.workspace() as folder:
             path = Path(folder) / "workspace.sqlite3"

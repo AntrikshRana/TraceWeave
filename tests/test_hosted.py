@@ -62,6 +62,7 @@ class HostedTests(unittest.TestCase):
         connection.close()
         return result
 
+    # Checks that unauthenticated users and invalid origins are denied by the hosted API.
     def test_auth_and_origin_boundaries(self):
         self.assertEqual(self.call('/api/state', user=None)[0], 401)
         self.assertFalse(self.call('/api/session', user=None)[1]['authenticated'])
@@ -72,6 +73,7 @@ class HostedTests(unittest.TestCase):
         self.assertIn('Secure', response[2]['Set-Cookie'])
         self.assertNotIn('access_token', response[1])
 
+    # Verifies state isolation, idempotent retries, and restore-from-disk consistency for hosted data.
     def test_round_trip_isolation_and_retry(self):
         data = {'source': 'firewall', 'text': 'src=192.0.2.1 dst=198.51.100.1 action=allow\r\n'}
         operation = str(uuid.uuid4())
@@ -90,6 +92,7 @@ class HostedTests(unittest.TestCase):
         finally:
             engine.close()
 
+    # Ensures a storage failure is surfaced as an error and never reports a successful write.
     def test_failed_save_does_not_report_success_or_persist(self):
         self.server.store.fail_save = True
         self.assertEqual(self.call('/api/ingest', {'text':'src=192.0.2.1 dst=198.51.100.1 action=deny'})[0], 503)
