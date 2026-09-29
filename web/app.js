@@ -8,7 +8,10 @@ const fieldHelp = {src_ip:'Where traffic came from', dst_ip:'Where traffic was g
 let state = {events:[], counts:{}, contracts:[], audit:[], targets:[]};
 let connected = false, loaded = false, refreshing = null, signature = '', filter = 'all', page = 1, selected = null, inputMethod = 'file', chosenFile = null;
 let importing = false;
-let hosted = location.hostname.endsWith('.onrender.com'), authenticated = !hosted;
+const ghPages = location.hostname.endsWith('.github.io');
+let hosted = location.hostname.endsWith('.onrender.com') || ghPages, authenticated = !hosted;
+// When served from GitHub Pages, route API calls to the Render backend.
+const API_BASE = ghPages ? 'https://traceweave.onrender.com' : '';
 const pageSize = 25;
 const number = value => Number(value || 0).toLocaleString();
 const countText = (value, noun = 'log') => `${number(value)} ${noun}${value === 1 ? '' : 's'}`;
@@ -38,9 +41,10 @@ function setConnection(ok) {
 async function request(path, payload) {
   let response;
   try {
-    response = await fetch(path, {
+    response = await fetch(API_BASE + path, {
       ...(payload === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json', 'Idempotency-Key':crypto.randomUUID()}, body:JSON.stringify(payload)}),
-      cache:'no-store', signal:AbortSignal.timeout(hosted ? 60000 : 15000)
+      cache:'no-store', signal:AbortSignal.timeout(hosted ? 60000 : 15000),
+      ...(API_BASE ? {credentials:'include'} : {})
     });
   } catch {
     setConnection(false);
@@ -316,6 +320,8 @@ async function startWorkspace() {
     $('.help-footer').textContent = 'The online service runs in your browser. Free hosting may take a moment to wake up after inactivity.';
     $('#ai-overview small').textContent = 'Check each suggested match before saving. Uncertain fields remain unassigned.';
     $('#sign-out').hidden = false;
+    // Point the Google OAuth link to the Render backend (important for GitHub Pages).
+    $('#auth-google').href = API_BASE + '/api/auth/google' + (ghPages ? '?return_to=' + encodeURIComponent(location.href) : '');
     if (!authenticated) {
       showAuth();
       const hash = new URLSearchParams(location.hash.replace(/^#/, ''));
