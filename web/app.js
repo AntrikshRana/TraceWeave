@@ -316,6 +316,7 @@ async function startWorkspace() {
     $('.help-footer').textContent = 'The online service runs in your browser. Free hosting may take a moment to wake up after inactivity.';
     $('#ai-overview small').textContent = 'Check each suggested match before saving. Uncertain fields remain unassigned.';
     $('#sign-out').hidden = false;
+    $('#auth-google').href = '/api/auth/google';
     if (!authenticated) {
       showAuth();
       const hash = new URLSearchParams(location.hash.replace(/^#/, ''));

@@ -54,6 +54,8 @@ class HostedTests(unittest.TestCase):
             headers.update({'Content-Type': 'application/json',
                 'Origin': origin or self.server.origin,
                 'Idempotency-Key': operation or str(uuid.uuid4())})
+        elif origin:
+            headers['Origin'] = origin
         connection = http.client.HTTPConnection('127.0.0.1', self.server.server_port)
         connection.request('GET' if data is None else 'POST', path,
             None if data is None else json.dumps(data), headers)
@@ -61,6 +63,18 @@ class HostedTests(unittest.TestCase):
         result = (response.status, json.loads(response.read()), dict(response.getheaders()))
         connection.close()
         return result
+
+    def options(self, path, origin='https://ixotic27.github.io'):
+        connection = http.client.HTTPConnection('127.0.0.1', self.server.server_port)
+        headers = {'Host': self.server.public_host, 'Origin': origin,
+                   'Access-Control-Request-Method': 'POST',
+                   'Access-Control-Request-Headers': 'Content-Type, Idempotency-Key'}
+        connection.request('OPTIONS', path, None, headers)
+        response = connection.getresponse()
+        headers_dict = dict(response.getheaders())
+        status = response.status
+        connection.close()
+        return status, headers_dict
 
     # Checks that unauthenticated users and invalid origins are denied by the hosted API.
     def test_auth_and_origin_boundaries(self):
@@ -97,6 +111,35 @@ class HostedTests(unittest.TestCase):
         self.server.store.fail_save = True
         self.assertEqual(self.call('/api/ingest', {'text':'src=192.0.2.1 dst=198.51.100.1 action=deny'})[0], 503)
         self.assertEqual(self.call('/api/state')[1]['events'], [])
+
+    def test_github_pages_cors_and_cross_origin_auth(self):
+        # 1. CORS Preflight OPTIONS for trusted GitHub Pages origin
+        status, headers = self.options('/api/events', origin='https://ixotic27.github.io')
+        self.assertEqual(status, 204)
+        self.assertEqual(headers.get('Access-Control-Allow-Origin'), 'https://ixotic27.github.io')
+        self.assertEqual(headers.get('Access-Control-Allow-Credentials'), 'true')
+        self.assertIn('POST', headers.get('Access-Control-Allow-Methods', ''))
+        self.assertIn('Content-Type', headers.get('Access-Control-Allow-Headers', ''))
+
+        # 2. CORS Preflight OPTIONS for untrusted origin is rejected
+        status, headers = self.options('/api/events', origin='https://evil.invalid')
+        self.assertEqual(status, 403)
+
+        # 3. Cross-origin GET request receives CORS response headers
+        status, body, headers = self.call('/api/session', user=None, origin='https://ixotic27.github.io')
+        self.assertEqual(status, 200)
+        self.assertFalse(body['authenticated'])
+        self.assertEqual(headers.get('Access-Control-Allow-Origin'), 'https://ixotic27.github.io')
+        self.assertEqual(headers.get('Access-Control-Allow-Credentials'), 'true')
+
+        # 4. Cross-origin POST login receives SameSite=None cookie and CORS headers
+        status, body, headers = self.call('/api/auth/login', {'email': 'alice@example.invalid', 'password': 'irrelevant'},
+                                          user=None, origin='https://ixotic27.github.io')
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get('Access-Control-Allow-Origin'), 'https://ixotic27.github.io')
+        self.assertEqual(headers.get('Access-Control-Allow-Credentials'), 'true')
+        self.assertIn('SameSite=None', headers.get('Set-Cookie', ''))
+        self.assertIn('Secure', headers.get('Set-Cookie', ''))
 
 
 if __name__ == '__main__':

@@ -26,6 +26,9 @@ from .server import Handler
 TABLES = {"events": 5, "contracts": 5, "results": 4, "audit": 4, "operations": 3}
 MAX_SNAPSHOT = 8 * 1024 * 1024
 COOKIE = "__Host-traceweave"
+# Cross-origin cookie attribute: SameSite=None is needed when the front-end
+# is served from a different origin (GitHub Pages) than the API (Render).
+CROSS_SITE_COOKIE = "; SameSite=None"
 
 
 def b64url(value):
@@ -151,17 +154,70 @@ class HostedHandler(Handler):
     def engine(self):
         return self.workspace_engine
 
+    def is_trusted_origin(self, origin):
+        if not origin:
+            return False
+        if origin == self.server.origin:
+            return True
+        gh = getattr(self.server, "github_pages_origin", None)
+        if gh and origin == gh:
+            return True
+        if re.fullmatch(r"https://[a-zA-Z0-9-]+\.github\.io", origin):
+            return True
+        return False
+
+    def is_cross_origin(self):
+        origin = self.headers.get("Origin")
+        if origin and origin != self.server.origin and self.is_trusted_origin(origin):
+            return True
+        return bool(getattr(self.server, "github_pages_origin", ""))
+
+    def is_trusted_return_url(self, url):
+        if not url:
+            return False
+        parsed = urlparse(url)
+        if parsed.scheme != "https":
+            return False
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        return self.is_trusted_origin(origin)
+
     def local_request(self):
-        return (self.headers.get("Host") == self.server.public_host and
-                self.headers.get("Origin", self.server.origin) == self.server.origin and
-                (self.command != "POST" or self.headers.get("Origin") == self.server.origin))
+        if self.headers.get("Host") != self.server.public_host:
+            return False
+        origin = self.headers.get("Origin")
+        if self.command == "GET":
+            return self.is_trusted_origin(origin) if origin else True
+        return self.is_trusted_origin(origin)
 
     def end_headers(self):
         self.send_header("Strict-Transport-Security", "max-age=31536000")
         self.send_header("Referrer-Policy", "no-referrer")
+        origin = self.headers.get("Origin")
+        if origin and self.is_trusted_origin(origin) and not getattr(self, "_cors_sent", False):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Vary", "Origin")
         for cookie in getattr(self, "cookie_headers", []):
             self.send_header("Set-Cookie", cookie)
         super().end_headers()
+
+    def do_OPTIONS(self):
+        self.connection.settimeout(30)
+        origin = self.headers.get("Origin")
+        if origin and self.is_trusted_origin(origin):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Idempotency-Key")
+            self.send_header("Access-Control-Max-Age", "86400")
+            self.send_header("Content-Length", "0")
+            self._cors_sent = True
+            self.end_headers()
+        else:
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
     def set_cookie(self, value):
         self.cookie_headers = getattr(self, "cookie_headers", [])
@@ -224,7 +280,9 @@ class HostedHandler(Handler):
             if not mutation and path in ("/", "/app.js", "/preload.js", "/style.css", "/privacy.html", "/terms.html") and not (path == "/" and parse_qs(urlparse(self.path).query).get("code")):
                 return super().do_GET()
             if mutation and path == "/api/auth/logout":
-                self.set_cookie(f"{COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0")
+                cross = self.is_cross_origin()
+                samesite = CROSS_SITE_COOKIE if cross else "; SameSite=Strict"
+                self.set_cookie(f"{COOKIE}=; Path=/; Secure; HttpOnly{samesite}; Max-Age=0")
                 return self.send({"ok": True})
             if not mutation and path == "/api/auth/google":
                 if not self.server.google_enabled:
@@ -234,6 +292,9 @@ class HostedHandler(Handler):
                 challenge = b64url(hashlib.sha256(verifier.encode()).digest())
                 self.set_cookie(f"__Host-traceweave-oauth-state={state}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=600")
                 self.set_cookie(f"__Host-traceweave-oauth-verifier={verifier}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=600")
+                return_to = parse_qs(urlparse(self.path).query).get("return_to", [""])[0]
+                if return_to and self.is_trusted_return_url(return_to):
+                    self.set_cookie(f"__Host-traceweave-oauth-return={b64url(return_to.encode())}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=600")
                 query = urlencode({"provider": "google", "redirect_to": self.server.origin + "/",
                     "state": state, "code_challenge": challenge, "code_challenge_method": "S256"})
                 return self.redirect(self.server.store.url + "/auth/v1/authorize?" + query)
@@ -242,29 +303,48 @@ class HostedHandler(Handler):
                 query = parse_qs(urlparse(self.path).query)
                 state = cookies.get("__Host-traceweave-oauth-state")
                 verifier = cookies.get("__Host-traceweave-oauth-verifier")
-                # Supabase's hosted PKCE callback normally returns only `code`.
-                # If it echoes state, compare it; the HttpOnly verifier cookie
-                # still binds this callback to the browser that started it.
+                return_cookie = cookies.get("__Host-traceweave-oauth-return")
+                return_url = "/"
+                if return_cookie:
+                    try:
+                        target = base64.urlsafe_b64decode(return_cookie.value.encode() + b"==").decode("utf-8")
+                        if self.is_trusted_return_url(target):
+                            return_url = target
+                    except Exception:
+                        pass
                 if not state or not verifier or (query.get("state") and state.value != query["state"][0]) or not query.get("code"):
-                    return self.redirect("/?auth_error=oauth")
+                    error_target = "/?auth_error=oauth"
+                    if return_url != "/":
+                        sep = "&" if "?" in return_url else "?"
+                        error_target = f"{return_url}{sep}auth_error=oauth"
+                    return self.redirect(error_target)
                 result = self.server.store.request("/auth/v1/token?grant_type=pkce", body={
                     "auth_code": query["code"][0], "code_verifier": verifier.value})
                 token = result.get("access_token", "")
                 if not re.fullmatch(r"[A-Za-z0-9_.-]+", token):
-                    return self.redirect("/?auth_error=oauth")
+                    error_target = "/?auth_error=oauth"
+                    if return_url != "/":
+                        sep = "&" if "?" in return_url else "?"
+                        error_target = f"{return_url}{sep}auth_error=oauth"
+                    return self.redirect(error_target)
                 age = min(int(result.get("expires_in", 3600)), 3600)
-                self.set_cookie(f"{COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={age}")
+                cross = self.is_cross_origin()
+                samesite = CROSS_SITE_COOKIE if cross else "; SameSite=Strict"
+                self.set_cookie(f"{COOKIE}={token}; Path=/; Secure; HttpOnly{samesite}; Max-Age={age}")
                 self.set_cookie("__Host-traceweave-oauth-state=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0")
                 self.set_cookie("__Host-traceweave-oauth-verifier=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0")
-                return self.redirect("/")
+                self.set_cookie("__Host-traceweave-oauth-return=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0")
+                return self.redirect(return_url)
             if mutation and path in ("/api/auth/login", "/api/auth/signup", "/api/auth/recover", "/api/auth/reset"):
                 _, data = self.read_json(8192)
                 email, password = data.get("email"), data.get("password")
                 if path.endswith("recover"):
                     if not isinstance(email, str) or len(email) > 320:
                         raise ValueError("Enter your email address")
+                    origin = self.headers.get("Origin")
+                    redirect_target = (origin + "/") if origin and self.is_trusted_origin(origin) else (self.server.origin + "/")
                     self.server.store.request("/auth/v1/recover", body={"email": email,
-                        "redirect_to": self.server.origin + "/"})
+                        "redirect_to": redirect_target})
                     return self.send({"message": "If an account exists for that email, a password reset link is on its way."})
                 if path.endswith("reset"):
                     token = data.get("token")
@@ -273,7 +353,9 @@ class HostedHandler(Handler):
                     if len(password) < 8:
                         raise ValueError("Use at least 8 characters for your password")
                     self.server.store.request("/auth/v1/user", token=token, body={"password": password}, method="PUT")
-                    self.set_cookie(f"{COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=3600")
+                    cross = self.is_cross_origin()
+                    samesite = CROSS_SITE_COOKIE if cross else "; SameSite=Strict"
+                    self.set_cookie(f"{COOKIE}={token}; Path=/; Secure; HttpOnly{samesite}; Max-Age=3600")
                     return self.send({"ok": True})
                 if not isinstance(email, str) or not isinstance(password, str) or len(email) > 320 or len(password) > 1024:
                     raise ValueError("Enter your email and password")
@@ -287,7 +369,9 @@ class HostedHandler(Handler):
                 if not re.fullmatch(r"[A-Za-z0-9_.-]+", token):
                     raise RemoteError("Could not establish a session.")
                 age = min(int(result.get("expires_in", 3600)), 3600)
-                self.set_cookie(f"{COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={age}")
+                cross = self.is_cross_origin()
+                samesite = CROSS_SITE_COOKIE if cross else "; SameSite=Strict"
+                self.set_cookie(f"{COOKIE}={token}; Path=/; Secure; HttpOnly{samesite}; Max-Age={age}")
                 return self.send({"ok": True})
             try:
                 token, user = self.session()
@@ -349,6 +433,10 @@ class HostedServer(ThreadingHTTPServer):
     daemon_threads = True
     # Bound simultaneous processing and memory on the free 512 MB instance.
     slots = threading.BoundedSemaphore(4)
+    public_host = ""
+    origin = ""
+    github_pages_origin = ""
+    google_enabled = False
 
     def process_request(self, request, client_address):
         if not self.slots.acquire(blocking=False):
@@ -376,6 +464,7 @@ def main():
     server = HostedServer(("0.0.0.0", int(os.environ.get("PORT", "10000"))), HostedHandler)
     server.public_host = public_host
     server.origin = "https://" + public_host
+    server.github_pages_origin = os.environ.get("GITHUB_PAGES_ORIGIN", "https://ixotic27.github.io")
     server.store = store
     server.google_enabled = os.environ.get("TRACEWEAVE_GOOGLE_ENABLED") == "1"
     print("TraceWeave online service ready", flush=True)
